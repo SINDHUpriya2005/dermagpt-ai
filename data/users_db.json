@@ -1,0 +1,7 @@
+{
+  "clinician@dermagpt.ai": {
+    "name": "Dr. Clinical User",
+    "role": "Dermatologist",
+    "password_hash": "scrypt:32768:8:1$TlL4nYD9Ra0IgkdW$5a81e5059d6699f570ffd5ee348765dbb8f754a4799ad599532faffe947020a934d520f2918923901713627100304859b865f115e7ef7635784fed005ea04b9f"
+  }
+}

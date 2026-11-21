@@ -1,0 +1,14 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+torchvision
+segmentation-models-pytorch
+timm
+grad-cam
+opencv-python-headless
+numpy
+pillow
+scikit-learn
+flask
+fpdf
+werkzeug
+gunicorn
