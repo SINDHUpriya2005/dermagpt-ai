@@ -1,12 +1,12 @@
-import os, io, json, base64, uuid
+import os, io, gc, json, base64, uuid
 from datetime import datetime
 from functools import wraps
 import cv2
 import numpy as np
 from PIL import Image
 import torch
+torch.set_num_threads(1)
 import timm
-import segmentation_models_pytorch as smp
 from pytorch_grad_cam import GradCAM
 from pytorch_grad_cam.utils.image import show_cam_on_image
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
@@ -17,31 +17,35 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from fpdf import FPDF
 
 PROJECT_DIR    = "."
-UNET_CKPT_PATH = f"{PROJECT_DIR}/models/unet_lesion.pth"
 CLF_CKPT_PATH  = f"{PROJECT_DIR}/models/efficientnet_b3.pth"
-FAISS_IDX_PATH = f"{PROJECT_DIR}/rag_index/derma_faiss.index"
 RAG_DOCS_PATH  = f"{PROJECT_DIR}/rag_index/derma_docs.npy"
 USERS_DB_PATH  = f"{PROJECT_DIR}/data/users_db.json"
 CASES_DB_PATH  = f"{PROJECT_DIR}/data/cases_db.json"
 
 os.makedirs(f"{PROJECT_DIR}/data", exist_ok=True)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cpu")
 
-unet_ckpt = torch.load(UNET_CKPT_PATH, map_location=device)
-unet_model = smp.Unet(encoder_name=unet_ckpt["encoder"], encoder_weights=None, in_channels=3, classes=1).to(device)
-unet_model.load_state_dict({k: v.float() for k, v in unet_ckpt["state_dict"].items()})
-unet_model.eval()
+# Lazy-loaded model cache so Gunicorn binds to $PORT instantly with low RAM
+_MODEL_CACHE = {"clf": None, "cam": None, "idx_to_diag": None, "img_size": 224}
 
-clf_ckpt = torch.load(CLF_CKPT_PATH, map_location=device)
-clf_model = timm.create_model("efficientnet_b3", pretrained=False, num_classes=7).to(device)
-clf_model.load_state_dict({k: v.float() for k, v in clf_ckpt["state_dict"].items()})
-clf_model.eval()
-idx_to_diag = clf_ckpt["idx_to_diag"]
+def get_classifier():
+    if _MODEL_CACHE["clf"] is None:
+        ckpt = torch.load(CLF_CKPT_PATH, map_location=device)
+        model = timm.create_model("efficientnet_b3", pretrained=False, num_classes=7).to(device)
+        model.load_state_dict({k: v.float() for k, v in ckpt["state_dict"].items()})
+        model.eval()
+        _MODEL_CACHE["clf"] = model
+        _MODEL_CACHE["cam"] = GradCAM(model=model, target_layers=[model.conv_head])
+        _MODEL_CACHE["idx_to_diag"] = ckpt["idx_to_diag"]
+        _MODEL_CACHE["img_size"] = ckpt.get("img_size", 224)
+        del ckpt
+        gc.collect()
+    return _MODEL_CACHE["clf"], _MODEL_CACHE["cam"], _MODEL_CACHE["idx_to_diag"], _MODEL_CACHE["img_size"]
 
-cam = GradCAM(model=clf_model, target_layers=[clf_model.conv_head])
 rag_docs  = np.load(RAG_DOCS_PATH, allow_pickle=True).tolist()
 tfidf_vec = TfidfVectorizer(stop_words="english")
 tfidf_mat = tfidf_vec.fit_transform(rag_docs)
+
 def rag_search(query, k=2):
     sims = cosine_similarity(tfidf_vec.transform([query]), tfidf_mat)[0]
     top_idx = np.argsort(sims)[::-1][:k]
@@ -67,6 +71,23 @@ def img_to_b64(rgb_arr):
     Image.fromarray(rgb_arr).save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
+def segment_lesion_fast(orig_rgb):
+    """Low-RAM dermoscopic lesion segmentation using CIE-Lab luminance + Otsu thresholding."""
+    lab = cv2.cvtColor(orig_rgb, cv2.COLOR_RGB2LAB)
+    l_chan = cv2.GaussianBlur(lab[:, :, 0], (7, 7), 0)
+    _, mask_bin = cv2.threshold(l_chan, 0, 1, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask_bin = cv2.morphologyEx(mask_bin, cv2.MORPH_CLOSE, kernel)
+    mask_bin = cv2.morphologyEx(mask_bin, cv2.MORPH_OPEN, kernel)
+    area_pct = round(float(mask_bin.mean()) * 100, 2)
+
+    overlay = orig_rgb.copy()
+    tint = np.zeros_like(orig_rgb); tint[:, :] = (6, 182, 212)
+    overlay[mask_bin == 1] = cv2.addWeighted(orig_rgb, 0.65, tint, 0.35, 0)[mask_bin == 1]
+    contours, _ = cv2.findContours(mask_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(overlay, contours, -1, (34, 211, 238), 2)
+    return overlay, area_pct
+
 def get_risk_tier(malig_prob):
     if malig_prob >= 50.0:
         return {"tier": "High Malignancy Probability", "level": "high", "advice": "Prompt dermatoscopic biopsy & specialist consultation recommended."}
@@ -86,8 +107,8 @@ def generate_local_clinical_report(patient_id, lesion_site, pred_label, pred_pro
         f"1. CLINICAL PROBABILITY & DIFFERENTIAL SUMMARY\n"
         f"• Patient / Lesion ID: {patient_id} | Anatomical Site: {lesion_site}\n"
         f"• Top Differential Probabilities: {diff_str}\n"
-        f"• Segmented Lesion Coverage (U-Net): {area_pct}% of dermoscopic frame\n"
-        f"• Clinical Reference (FAISS RAG): {retrieved_guideline}\n"
+        f"• Segmented Lesion Coverage: {area_pct}% of dermoscopic frame\n"
+        f"• Clinical Reference (RAG): {retrieved_guideline}\n"
         f"• Recommended Next Step: {risk_info['advice']}\n\n"
         f"2. PATIENT WELLNESS & MONITORING GUIDANCE\n"
         f"• Understanding Your Probability Score: This AI screening model estimates a {malig_prob}% probability of malignant/precancerous features and a {benign_prob}% probability of benign features. Because AI probabilities are statistical estimates rather than a definitive diagnosis, an in-person dermatologist check is always recommended.\n"
@@ -111,7 +132,7 @@ def generate_local_chat_reply(user_msg):
     return f"DermaGPT Clinical Reference:\n\n• {best_doc}\n\n• {second_doc}"
 
 app = Flask(__name__)
-app.secret_key = "dermagpt_hf_permanent_portal_secret"
+app.secret_key = "dermagpt_render_memory_safe_secret"
 
 def login_required(f):
     @wraps(f)
@@ -132,7 +153,7 @@ AUTH_HTML = """<!DOCTYPE html>
           <span class="text-2xl font-bold text-white">DermaGPT <span class="text-cyan-400">AI</span></span>
         </div>
         <h2 class="text-xl font-semibold text-white mb-3">Probabilistic Skin Lesion Analysis & Explainable AI</h2>
-        <p class="text-xs text-slate-400 leading-relaxed">Sign in or create an account to evaluate dermoscopic probability distributions, U-Net lesion segmentation, and Grad-CAM heatmaps.</p>
+        <p class="text-xs text-slate-400 leading-relaxed">Sign in or create an account to evaluate dermoscopic probability distributions, lesion segmentation, and Grad-CAM heatmaps.</p>
       </div>
       <div class="pt-6 border-t border-slate-800 text-xs text-slate-400 space-y-1">
         <p class="text-emerald-400 font-medium">• 24/7 Cloud Clinical Engine Active</p>
@@ -242,7 +263,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       {% if result %}
       <div id="section-xai" class="grid grid-cols-1 md:grid-cols-3 gap-5">
         <div class="bg-[#131c29] border border-slate-800 p-4 rounded-2xl"><h3 class="text-sm font-semibold text-white mb-2">Original Dermoscopy</h3><img src="data:image/png;base64,{{ result.orig_b64 }}" class="w-full h-56 object-cover rounded-xl" /></div>
-        <div class="bg-[#131c29] border border-slate-800 p-4 rounded-2xl"><h3 class="text-sm font-semibold text-white mb-2">U-Net Segmentation ({{ result.area_pct }}%)</h3><img src="data:image/png;base64,{{ result.mask_overlay_b64 }}" class="w-full h-56 object-cover rounded-xl" /></div>
+        <div class="bg-[#131c29] border border-slate-800 p-4 rounded-2xl"><h3 class="text-sm font-semibold text-white mb-2">Lesion Segmentation ({{ result.area_pct }}%)</h3><img src="data:image/png;base64,{{ result.mask_overlay_b64 }}" class="w-full h-56 object-cover rounded-xl" /></div>
         <div class="bg-[#131c29] border border-slate-800 p-4 rounded-2xl"><h3 class="text-sm font-semibold text-white mb-2">Grad-CAM XAI Heatmap</h3><img src="data:image/png;base64,{{ result.cam_b64 }}" class="w-full h-56 object-cover rounded-xl" /></div>
       </div>
       {% endif %}
@@ -381,25 +402,15 @@ def logout():
 def dashboard():
     result = None
     if request.method == "POST":
+        clf_model, cam, idx_to_diag, c_size = get_classifier()
         patient_id, lesion_site = request.form.get("patient_id", "PT-001").strip(), request.form.get("lesion_site", "Back").strip()
         orig_bgr = cv2.imdecode(np.frombuffer(request.files["lesion_image"].read(), np.uint8), cv2.IMREAD_COLOR)
         orig_rgb = cv2.cvtColor(orig_bgr, cv2.COLOR_BGR2RGB)
         h, w, _ = orig_rgb.shape
         mean, std = np.array([0.485, 0.456, 0.406], dtype=np.float32), np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-        u_size = unet_ckpt["img_size"]
-        u_tensor = torch.tensor((cv2.resize(orig_rgb, (u_size, u_size)).astype(np.float32)/255.0 - mean)/std).permute(2,0,1).unsqueeze(0).to(device)
-        with torch.no_grad(): mask_bin = (torch.sigmoid(unet_model(u_tensor))[0, 0].cpu().numpy() > 0.5).astype(np.uint8)
-        area_pct = round(float(mask_bin.mean()) * 100, 2)
-        mask_resized = cv2.resize(mask_bin, (w, h), interpolation=cv2.INTER_NEAREST)
+        overlay_rgb, area_pct = segment_lesion_fast(orig_rgb)
 
-        overlay_rgb = orig_rgb.copy()
-        teal_tint = np.zeros_like(orig_rgb); teal_tint[:, :] = (6, 182, 212)
-        overlay_rgb[mask_resized == 1] = cv2.addWeighted(orig_rgb, 0.65, teal_tint, 0.35, 0)[mask_resized == 1]
-        contours, _ = cv2.findContours(mask_resized, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(overlay_rgb, contours, -1, (34, 211, 238), 2)
-
-        c_size = clf_ckpt["img_size"]
         c_tensor = torch.tensor((cv2.resize(orig_rgb, (c_size, c_size)).astype(np.float32)/255.0 - mean)/std).permute(2,0,1).unsqueeze(0).to(device)
         with torch.no_grad(): probs = torch.softmax(clf_model(c_tensor), dim=1)[0].cpu().numpy()
 
@@ -420,6 +431,7 @@ def dashboard():
         }
         CASES_DB.append(case_record); save_json(CASES_DB_PATH, CASES_DB)
         result = {**case_record, "prob_bars": prob_bars, "orig_b64": img_to_b64(orig_rgb), "mask_overlay_b64": img_to_b64(overlay_rgb), "cam_b64": img_to_b64(gradcam_rgb)}
+        gc.collect()
 
     total = len(CASES_DB)
     stats = {"total": total, "elevated_count": sum(1 for c in CASES_DB if c.get("malig_prob", 0) >= 20.0), "avg_malig": round(sum(c.get("malig_prob", 0) for c in CASES_DB)/total, 1) if total else 0.0, "avg_area": round(sum(c["area_pct"] for c in CASES_DB)/total, 1) if total else 0.0}
@@ -450,4 +462,5 @@ def download_report(case_id):
     return send_file(io.BytesIO(pdf.output(dest="S").encode("latin-1")), as_attachment=True, download_name=f"DermaGPT_{case['patient_id']}.pdf", mimetype="application/pdf")
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=7860)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
